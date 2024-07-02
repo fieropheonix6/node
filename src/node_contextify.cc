@@ -51,7 +51,6 @@ using v8::FunctionTemplate;
 using v8::HandleScope;
 using v8::IndexedPropertyHandlerConfiguration;
 using v8::Int32;
-using v8::Integer;
 using v8::Intercepted;
 using v8::Isolate;
 using v8::Just;
@@ -177,22 +176,20 @@ void ContextifyContext::InitializeGlobalTemplates(IsolateData* isolate_data) {
   NamedPropertyHandlerConfiguration config(
       PropertyGetterCallback,
       PropertySetterCallback,
-      PropertyQueryCallback,
+      PropertyDescriptorCallback,
       PropertyDeleterCallback,
       PropertyEnumeratorCallback,
       PropertyDefinerCallback,
-      PropertyDescriptorCallback,
       {},
       PropertyHandlerFlags::kHasNoSideEffect);
 
   IndexedPropertyHandlerConfiguration indexed_config(
       IndexedPropertyGetterCallback,
       IndexedPropertySetterCallback,
-      IndexedPropertyQueryCallback,
+      IndexedPropertyDescriptorCallback,
       IndexedPropertyDeleterCallback,
       PropertyEnumeratorCallback,
       IndexedPropertyDefinerCallback,
-      IndexedPropertyDescriptorCallback,
       {},
       PropertyHandlerFlags::kHasNoSideEffect);
 
@@ -357,14 +354,12 @@ void ContextifyContext::RegisterExternalReferences(
     ExternalReferenceRegistry* registry) {
   registry->Register(MakeContext);
   registry->Register(CompileFunction);
-  registry->Register(PropertyQueryCallback);
   registry->Register(PropertyGetterCallback);
   registry->Register(PropertySetterCallback);
   registry->Register(PropertyDescriptorCallback);
   registry->Register(PropertyDeleterCallback);
   registry->Register(PropertyEnumeratorCallback);
   registry->Register(PropertyDefinerCallback);
-  registry->Register(IndexedPropertyQueryCallback);
   registry->Register(IndexedPropertyGetterCallback);
   registry->Register(IndexedPropertySetterCallback);
   registry->Register(IndexedPropertyDescriptorCallback);
@@ -461,51 +456,6 @@ ContextifyContext* ContextifyContext::Get(Local<Object> object) {
 
 bool ContextifyContext::IsStillInitializing(const ContextifyContext* ctx) {
   return ctx == nullptr || ctx->context_.IsEmpty();
-}
-
-// static
-Intercepted ContextifyContext::PropertyQueryCallback(
-    Local<Name> property, const PropertyCallbackInfo<Integer>& args) {
-  ContextifyContext* ctx = ContextifyContext::Get(args);
-
-  // Still initializing
-  if (IsStillInitializing(ctx)) {
-    return Intercepted::kNo;
-  }
-
-  Local<Context> context = ctx->context();
-  Local<Object> sandbox = ctx->sandbox();
-
-  PropertyAttribute attr;
-
-  Maybe<bool> maybe_has = sandbox->HasRealNamedProperty(context, property);
-  if (maybe_has.IsNothing()) {
-    return Intercepted::kNo;
-  } else if (maybe_has.FromJust()) {
-    Maybe<PropertyAttribute> maybe_attr =
-        sandbox->GetRealNamedPropertyAttributes(context, property);
-    if (!maybe_attr.To(&attr)) {
-      return Intercepted::kNo;
-    }
-    args.GetReturnValue().Set(attr);
-    return Intercepted::kYes;
-  } else {
-    maybe_has = ctx->global_proxy()->HasRealNamedProperty(context, property);
-    if (maybe_has.IsNothing()) {
-      return Intercepted::kNo;
-    } else if (maybe_has.FromJust()) {
-      Maybe<PropertyAttribute> maybe_attr =
-          ctx->global_proxy()->GetRealNamedPropertyAttributes(context,
-                                                              property);
-      if (!maybe_attr.To(&attr)) {
-        return Intercepted::kNo;
-      }
-      args.GetReturnValue().Set(attr);
-      return Intercepted::kYes;
-    }
-  }
-
-  return Intercepted::kNo;
 }
 
 // static
@@ -757,20 +707,6 @@ void ContextifyContext::PropertyEnumeratorCallback(
     return;
 
   args.GetReturnValue().Set(properties);
-}
-
-// static
-Intercepted ContextifyContext::IndexedPropertyQueryCallback(
-    uint32_t index, const PropertyCallbackInfo<Integer>& args) {
-  ContextifyContext* ctx = ContextifyContext::Get(args);
-
-  // Still initializing
-  if (IsStillInitializing(ctx)) {
-    return Intercepted::kNo;
-  }
-
-  return ContextifyContext::PropertyQueryCallback(
-      Uint32ToName(ctx->context(), index), args);
 }
 
 // static
@@ -1090,7 +1026,7 @@ void ContextifyScript::CreateCachedData(
     const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   ContextifyScript* wrapped_script;
-  ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.This());
   Local<UnboundScript> unbound_script =
       PersistentToLocal::Default(env->isolate(), wrapped_script->script_);
   std::unique_ptr<ScriptCompiler::CachedData> cached_data(
@@ -1110,7 +1046,7 @@ void ContextifyScript::RunInContext(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
 
   ContextifyScript* wrapped_script;
-  ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.Holder());
+  ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.This());
 
   CHECK_EQ(args.Length(), 5);
   CHECK(args[0]->IsObject() || args[0]->IsNull());
@@ -1171,7 +1107,7 @@ bool ContextifyScript::EvalMachine(Local<Context> context,
 
   if (!env->can_call_into_js())
     return false;
-  if (!ContextifyScript::InstanceOf(env, args.Holder())) {
+  if (!ContextifyScript::InstanceOf(env, args.This())) {
     THROW_ERR_INVALID_THIS(
         env,
         "Script methods can only be called on script instances.");
@@ -1180,13 +1116,28 @@ bool ContextifyScript::EvalMachine(Local<Context> context,
 
   TryCatchScope try_catch(env);
   ContextifyScript* wrapped_script;
-  ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.Holder(), false);
+  ASSIGN_OR_RETURN_UNWRAP(&wrapped_script, args.This(), false);
   Local<UnboundScript> unbound_script =
       PersistentToLocal::Default(env->isolate(), wrapped_script->script_);
   Local<Script> script = unbound_script->BindToCurrentContext();
 
 #if HAVE_INSPECTOR
   if (break_on_first_line) {
+    if (UNLIKELY(!env->permission()->is_granted(
+            env,
+            permission::PermissionScope::kInspector,
+            "PauseOnNextJavascriptStatement"))) {
+      node::permission::Permission::ThrowAccessDenied(
+          env,
+          permission::PermissionScope::kInspector,
+          "PauseOnNextJavascriptStatement");
+      if (display_errors) {
+        // We should decorate non-termination exceptions
+        errors::DecorateErrorStack(env, try_catch);
+      }
+      try_catch.ReThrow();
+      return false;
+    }
     env->inspector_agent()->PauseOnNextJavascriptStatement("Break on start");
   }
 #endif
